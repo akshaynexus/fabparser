@@ -1,4 +1,4 @@
-const { parsePdfs, ParserType } = require('../statement-parser/dist/index.js');
+const { parsePdfs, ParserType } = require('statement-parser-fab');
 const fs = require('fs');
 const path = require('path');
 

@@ -9,6 +9,6 @@
   },
   "dependencies": {
     "pdf-parse": "^1.1.1",
-    "statement-parser-fab": "^2.0.5"
+    "statement-parser-fab": "^2.0.7"
   }
 }
