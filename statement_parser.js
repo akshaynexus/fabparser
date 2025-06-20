@@ -1,697 +1,796 @@
 const { parsePdfs, ParserType } = require('../statement-parser/dist/index.js');
-const { readdirSync, existsSync, writeFileSync, readFileSync } = require('fs');
-const { join } = require('path');
+const fs = require('fs');
+const path = require('path');
+
+// ==========================================
+// CONFIGURATION - Easy to customize
+// ==========================================
+
+const CONFIG = {
+    // File paths
+    statementsFolder: './statements',
+    categoriesFile: './categories.json',
+    outputFile: './transaction_summary.json',
+    
+    // Currency
+    currency: 'AED',
+    
+    // Thresholds
+    smallTransactionLimit: 5,        // Transactions under this are likely adjustments
+    largeTransactionLimit: 100,      // Track filtered transactions above this
+    reconciliationTolerance: 1000,   // Acceptable difference in reconciliation
+    
+    // Debug options
+    debugFiltering: false,           // Set to true to see what gets filtered as internal
+};
+
+// ==========================================
+// CATEGORIES - Add your own merchant mappings here
+// ==========================================
+
+const DEFAULT_CATEGORIES = {
+    // Grocery stores
+    "CARREFOUR": "Groceries",
+    "LULU": "Groceries",
+    "SPINNEYS": "Groceries",
+    "CHOITHRAMS": "Groceries",
+    
+    // Online shopping
+    "AMAZON": "Shopping",
+    "NOON": "Shopping",
+    "MALL": "Shopping",
+    "IKEA": "Home & Garden",
+    
+    // Restaurants & cafes
+    "MCDONALDS": "Food & Dining",
+    "KFC": "Food & Dining",
+    "SUBWAY": "Food & Dining",
+    "STARBUCKS": "Food & Dining",
+    "COSTA": "Food & Dining",
+    "RESTAURANT": "Food & Dining",
+    "CAFE": "Food & Dining",
+    
+    // Gas stations
+    "PETROL": "Transportation",
+    "ADNOC": "Transportation",
+    "EPPCO": "Transportation",
+    "ENOC": "Transportation",
+    
+    // Transportation services
+    "TAXI": "Transportation",
+    "UBER": "Transportation",
+    "CAREEM": "Transportation",
+    "SALIK": "Transportation",
+    "PARKING": "Transportation",
+    "RTA": "Transportation",
+    
+    // Utilities
+    "DEWA": "Utilities",
+    "ETISALAT": "Utilities",
+    "DU": "Utilities",
+    
+    // Healthcare
+    "HOSPITAL": "Healthcare",
+    "CLINIC": "Healthcare",
+    "PHARMACY": "Healthcare",
+    "MEDICAL": "Healthcare",
+    
+    // Entertainment
+    "CINEMA": "Entertainment",
+    "VOX": "Entertainment",
+    "NETFLIX": "Entertainment",
+    "SPOTIFY": "Entertainment",
+    
+    // Banking
+    "ATM": "Banking",
+    "TRANSFER": "Banking",
+    "FEE": "Banking",
+    "CHEQUE": "Banking",
+    "OUTWARD CHEQUE RETURNED": "Banking",
+    
+    // Default for unmatched
+    "DEFAULT": "Uncategorized"
+};
+
+// ==========================================
+// TRANSACTION FILTERS - What counts as internal banking operations
+// ==========================================
+
+const INTERNAL_OPERATIONS = {
+    // These keywords indicate internal banking operations
+    keywords: [
+        'reverse charges',      // Fee reversals
+        'fee reversal',        // Fee reversals
+        'charge reversal',     // Charge reversals
+        'balance adjustment',  // Bank adjustments
+        'atm cash deposit',    // Depositing your own cash
+        'cash deposit',        // Depositing your own cash
+        'switch transaction',  // ATM operations
+        'outward cheque returned', // Returned cheques
+        'sw wdl chgs',         // Switch withdrawal charges
+        'vat aed',             // VAT adjustments (these are not real expenses)
+        'pos settlement  vat', // POS VAT settlements
+        'balance brought forward', // Balance carry forwards
+        'balance carried forward', // Balance carry forwards
+        'cash withdrawal',     // ATM cash withdrawals
+        'balance carried forward', // Balance carry forwards
+        'cash withdrawal',     // ATM cash withdrawals
+        'standing order'       // Standing orders are typically internal
+    ],
+    
+    // Special rules
+    rules: {
+            // Only specific outward transfers are internal (not salary/income transfers)
+        internalTransfers: {
+            patterns: [
+                'transfer',            // Generic transfers (most are internal)
+                'outward transfer',    // Your own transfers to other accounts
+                'internal transfer',   // Bank internal transfers
+                'self transfer',       // Self transfers
+                'account transfer'     // Account to account transfers
+            ],
+            excludes: [
+                'inward telex transfer',  // Salary/income from companies
+                'inward transfer',        // Income transfers
+                'salary transfer',        // Salary payments
+                'payment transfer',       // Business payments
+                'ipp transfer instant payment' // IPP transfers are handled separately
+            ]
+        },
+        
+        // Small credits are usually adjustments
+        smallCredits: {
+            type: 'Credit',
+            maxAmount: CONFIG.smallTransactionLimit
+        }
+    }
+};
+
+// ==========================================
+// TEXT CLEANING RULES - How to clean merchant names
+// ==========================================
+
+const CLEANUP_RULES = [
+    // Remove transaction prefixes
+    { pattern: /^POS Settlement\s+/i, replacement: '', reason: 'Remove POS prefix' },
+    { pattern: /^Outward Cheque Returned\s*/i, replacement: 'Returned Cheque - ', reason: 'Clean cheque return prefix' },
+    
+    // Remove dates and times
+    { pattern: /^\d+\/\d+\s+/, replacement: '', reason: 'Remove date at start' },
+    { pattern: /\s+\d{2}:\d{2}\s*$/, replacement: '', reason: 'Remove time at end' },
+    
+    // Remove currency and amounts
+    { pattern: /\s+(AED|USD|THB|MYR|EUR|GBP)\s*[\d\.]*\s*$/i, replacement: '', reason: 'Remove currency at end' },
+    { pattern: /\s+[\d\.]+\s*$/, replacement: '', reason: 'Remove amounts at end' },
+    { pattern: /\s+(AED|USD|THB|MYR|EUR|GBP)\s+/gi, replacement: ' ', reason: 'Remove currency in middle' },
+    
+    // Remove duplicate city names (e.g., "BANGKOK BANGKOK" -> "BANGKOK")
+    { pattern: /\s+(BANGKOK|KUALA LUMPUR|ABU DHABI|DUBAI|SINGAPORE)\s+\1/i, replacement: ' $1', reason: 'Remove duplicate city' },
+    
+    // Remove city/country suffixes
+    { pattern: /\s+(BANGKOK|KUALA LUMPUR|ABU DHABI|DUBAI|SINGAPORE)\s+(TH|MY|AE|SG|US)/i, replacement: '', reason: 'Remove city+country' },
+    
+    // Remove trailing numbers and spaces
+    { pattern: /\s+\d+$/, replacement: '', reason: 'Remove trailing numbers' },
+    { pattern: /\s+/g, replacement: ' ', reason: 'Normalize spaces' }
+];
+
+// ==========================================
+// HELPER FUNCTIONS
+// ==========================================
+
+// Format amount with currency
+function formatMoney(amount) {
+    return `${amount.toFixed(2)} ${CONFIG.currency}`;
+}
+
+// Convert date to month string (YYYY-MM)
+function getMonth(date) {
+    const d = date instanceof Date ? date : new Date(date);
+    return d.toISOString().substring(0, 7);
+}
+
+// Extract balance from transaction text (last number in the line)
+function extractBalance(text) {
+    if (!text) return null;
+    // Match numbers with commas and decimal points at end of line
+    const match = text.match(/[\d,]+(?:\.\d{2})?(?=\s*$)/);
+    return match ? parseFloat(match[0].replace(/,/g, '')) : null;
+}
+
+// Load JSON file safely
+function loadJsonFile(filepath, defaultValue) {
+    try {
+        if (fs.existsSync(filepath)) {
+            return JSON.parse(fs.readFileSync(filepath, 'utf8'));
+        }
+    } catch (error) {
+        console.error(`Error loading ${filepath}:`, error.message);
+    }
+    return defaultValue;
+}
+
+// Save JSON file
+function saveJsonFile(filepath, data) {
+    try {
+        fs.writeFileSync(filepath, JSON.stringify(data, null, 2));
+        console.log(`✓ Saved to ${filepath}`);
+    } catch (error) {
+        console.error(`Error saving ${filepath}:`, error.message);
+    }
+}
+
+// Get all PDF files from folder
+function getPdfFiles(folder) {
+    if (!fs.existsSync(folder)) {
+        console.error(`Folder '${folder}' not found!`);
+        return [];
+    }
+    
+    return fs.readdirSync(folder)
+        .filter(file => file.toLowerCase().endsWith('.pdf'))
+        .map(file => path.join(folder, file));
+}
+
+// ==========================================
+// TRANSACTION PROCESSING
+// ==========================================
+
+// Clean up merchant name from transaction description
+function cleanMerchantName(description) {
+    if (!description) return "Unknown";
+    
+    let cleaned = description;
+    
+    // Apply each cleanup rule
+    for (const rule of CLEANUP_RULES) {
+        cleaned = cleaned.replace(rule.pattern, rule.replacement);
+    }
+    
+    return cleaned.trim() || "Unknown";
+}
+
+// Find category for a transaction
+function findCategory(description, categories) {
+    if (!description) return "Uncategorized";
+    
+    const upperDesc = description.toUpperCase();
+    
+    // Special case for ATM withdrawals
+    if (upperDesc.includes("SWITCH TRANSACTION")) {
+        return "ATM/Cash Withdrawal";
+    }
+    
+    // Special case for cheque returns
+    if (upperDesc.includes("OUTWARD CHEQUE RETURNED") || upperDesc.includes("CHEQUE RETURNED")) {
+        return "Banking";
+    }
+    
+    // Check each category keyword
+    for (const [keyword, category] of Object.entries(categories)) {
+        if (keyword !== "DEFAULT" && upperDesc.includes(keyword)) {
+            return category;
+        }
+    }
+    
+    return categories.DEFAULT || "Uncategorized";
+}
+
+// Check if transaction is internal (not real income/expense)
+function isInternalTransaction(transaction) {
+    const desc = transaction.description.toLowerCase();
+    
+    // Check if it's part of a bounced cheque pair
+    if (transaction.isBouncedCheque) {
+        if (CONFIG.debugFiltering) {
+            console.log(`🔍 FILTERED (bounced cheque): ${transaction.description} - ${formatMoney(transaction.amount)}`);
+        }
+        return true;
+    }
+    
+    // Check keywords
+    for (const keyword of INTERNAL_OPERATIONS.keywords) {
+        if (desc.includes(keyword)) {
+            if (CONFIG.debugFiltering) {
+                console.log(`🔍 FILTERED (keyword "${keyword}"): ${transaction.description} - ${formatMoney(transaction.amount)}`);
+            }
+            return true;
+        }
+    }
+    
+    // Check transfer rule
+    const transferRule = INTERNAL_OPERATIONS.rules.internalTransfers;
+    
+    // Check if it matches any internal transfer patterns
+    const matchesInternalPattern = transferRule.patterns.some(pattern => desc.includes(pattern));
+    
+    // Check if it matches any exclude patterns (legitimate income)
+    const matchesExcludePattern = transferRule.excludes.some(exclude => desc.includes(exclude));
+    
+    // Only mark as internal if it matches internal patterns AND doesn't match exclude patterns
+    if (matchesInternalPattern && !matchesExcludePattern) {
+        if (CONFIG.debugFiltering) {
+            console.log(`🔍 FILTERED (transfer rule): ${transaction.description} - ${formatMoney(transaction.amount)}`);
+        }
+        return true;
+    }
+    
+    // Check small credit rule
+    const creditRule = INTERNAL_OPERATIONS.rules.smallCredits;
+    if (transaction.type === creditRule.type && transaction.amount < creditRule.maxAmount) {
+        if (CONFIG.debugFiltering) {
+            console.log(`🔍 FILTERED (small credit): ${transaction.description} - ${formatMoney(transaction.amount)}`);
+        }
+        return true;
+    }
+    
+    return false;
+}
+
+// Fix transaction type (some credits are actually debits)
+function fixTransactionType(transaction, originalType) {
+    // The library already correctly classifies transactions
+    // Income transactions are credits with positive amounts
+    // Expense transactions are debits with negative amounts
+    return originalType;
+}
+
+// ==========================================
+// MAIN PARSER
+// ==========================================
 
 class FABStatementParser {
     constructor() {
-        this.statementsDir = './statements';
-        this.categoriesFile = './categories.json';
-        this.outputFile = './transaction_summary.json';
-        this.allTransactions = [];
-        this.merchantCategories = this.loadCategories();
-    }
-
-    // Load existing categories or create default ones
-    loadCategories() {
-        if (existsSync(this.categoriesFile)) {
-            try {
-                const data = readFileSync(this.categoriesFile, 'utf8');
-                return JSON.parse(data);
-            } catch (error) {
-                console.error('Error loading categories file:', error.message);
-                return this.getDefaultCategories();
-            }
-        }
-        return this.getDefaultCategories();
-    }
-
-    // Default category mappings
-    getDefaultCategories() {
-        return {
-            // Shopping & Retail
-            "AMAZON": "Shopping",
-            "CARREFOUR": "Groceries",
-            "LULU": "Groceries",
-            "SPINNEYS": "Groceries",
-            "CHOITHRAMS": "Groceries",
-            "MALL": "Shopping",
-            "IKEA": "Home & Garden",
-            
-            // Food & Dining
-            "MCDONALDS": "Food & Dining",
-            "KFC": "Food & Dining",
-            "SUBWAY": "Food & Dining",
-            "STARBUCKS": "Food & Dining",
-            "COSTA": "Food & Dining",
-            "RESTAURANT": "Food & Dining",
-            "CAFE": "Food & Dining",
-            
-            // Transportation
-            "PETROL": "Transportation",
-            "ADNOC": "Transportation",
-            "EPPCO": "Transportation",
-            "TAXI": "Transportation",
-            "UBER": "Transportation",
-            "CAREEM": "Transportation",
-            "SALIK": "Transportation",
-            "PARKING": "Transportation",
-            
-            // Utilities & Bills
-            "DEWA": "Utilities",
-            "ETISALAT": "Utilities",
-            "DU": "Utilities",
-            "INTERNET": "Utilities",
-            "MOBILE": "Utilities",
-            
-            // Healthcare
-            "HOSPITAL": "Healthcare",
-            "CLINIC": "Healthcare",
-            "PHARMACY": "Healthcare",
-            "MEDICAL": "Healthcare",
-            
-            // Entertainment
-            "CINEMA": "Entertainment",
-            "VOX": "Entertainment",
-            "REEL": "Entertainment",
-            "NETFLIX": "Entertainment",
-            "SPOTIFY": "Entertainment",
-            
-            // Banking & Finance
-            "ATM": "Banking",
-            "TRANSFER": "Banking",
-            "WITHDRAWAL": "Banking",
-            "DEPOSIT": "Banking",
-            "FEE": "Banking",
-            "CHARGE": "Banking",
-            
-            // Default category
-            "DEFAULT": "Uncategorized"
+        // Load or create categories file
+        this.categories = loadJsonFile(CONFIG.categoriesFile, DEFAULT_CATEGORIES);
+        
+        // Storage for parsed data
+        this.transactions = [];
+        this.stats = {
+            totals: { debits: 0, credits: 0 },
+            filtered: { debits: 0, credits: 0 },
+            byCategory: {},
+            byMonth: {},
+            balances: {}
         };
     }
-
-    // Save categories to file
-    saveCategories() {
-        try {
-            writeFileSync(this.categoriesFile, JSON.stringify(this.merchantCategories, null, 2));
-            console.log(`Categories saved to ${this.categoriesFile}`);
-        } catch (error) {
-            console.error('Error saving categories:', error.message);
-        }
-    }
-
-    // Categorize transaction based on description
-    categorizeTransaction(description) {
-        if (!description) return "Uncategorized";
+    
+    async run() {
+        console.log('=== FAB Bank Statement Parser ===\n');
         
-        const upperDesc = description.toUpperCase();
+        // Save categories file so users can customize it
+        saveJsonFile(CONFIG.categoriesFile, this.categories);
+        console.log('✓ Categories file created/updated');
+        console.log('  (Edit categories.json to customize merchant categorization)\n');
         
-        // Handle specific transaction types first
-        if (upperDesc.includes("SWITCH TRANSACTION")) {
-            return "ATM/Cash Withdrawal"; // Treat as ATM withdrawal
-        }
-        
-        // Check for exact matches
-        for (const [merchant, category] of Object.entries(this.merchantCategories)) {
-            if (merchant !== "DEFAULT" && upperDesc.includes(merchant)) {
-                return category;
-            }
-        }
-        
-        return this.merchantCategories.DEFAULT || "Uncategorized";
-    }
-
-    // Extract merchant name from description
-    extractMerchant(description) {
-        if (!description) return "Unknown";
-        
-        // Clean up common patterns in FAB statements
-        let merchant = description
-            .replace(/^POS Settlement\s+/i, '') // Remove "POS Settlement" prefix
-            .replace(/^\d+\/\d+\s+/, '') // Remove date patterns at start
-            .replace(/\s+\d{2}:\d{2}\s*$/, '') // Remove time patterns at end
-            .replace(/\s+(AED|USD|THB|MYR|EUR|GBP)\s*[\d\.]*\s*$/i, '') // Remove currency and amounts at end
-            .replace(/\s+[\d\.]+\s*$/g, '') // Remove any remaining amounts at end
-            .replace(/\s+(AED|USD|THB|MYR|EUR|GBP)\s+/gi, ' ') // Remove currency codes in middle
-            .replace(/\s+\d+\s*$/g, '') // Remove standalone numbers at end
-            .replace(/(\s+BANGKOK)\s+BANGKOK\s*.*$/i, '$1') // Remove repeated BANGKOK and trailing content
-            .replace(/(\s+KUALA LUMPUR)\s+KUALA LUMPUR\s*.*$/i, '$1') // Remove repeated KUALA LUMPUR
-            .replace(/(\s+ABU DHABI)\s+ABU DHABI\s*.*$/i, '$1') // Remove repeated ABU DHABI
-            .replace(/(\s+DUBAI)\s+DUBAI\s*.*$/i, '$1') // Remove repeated DUBAI
-            .replace(/(\s+SINGAPORE)\s+SINGAPORE\s*.*$/i, '$1') // Remove repeated SINGAPORE
-            .replace(/\s+(BANGKOK|KUALA LUMPUR|ABU DHABI|DUBAI|SINGAPORE)\s+TH\s*$/i, '') // Remove "BANGKOK TH" type suffixes  
-            .replace(/\s+(BANGKOK|KUALA LUMPUR|ABU DHABI|DUBAI|SINGAPORE)\s+THB.*$/i, '') // Remove "BANGKOK THB" patterns
-            .replace(/\s+THB\s+\d+.*$/i, '') // Remove "THB 275" type patterns
-            .replace(/\s+USD\s+\d+.*$/i, '') // Remove "USD 15" type patterns  
-            .replace(/\s+MYR\s+\d+.*$/i, '') // Remove "MYR 20" type patterns
-            .replace(/\s+\d+\s*$/, '') // Final cleanup of trailing numbers
-            .replace(/\s+/g, ' ') // Normalize whitespace
-            .trim();
-        
-        // Additional cleanup for specific patterns
-        merchant = merchant
-            .replace(/^(.*?)\s+(BA|TH|MY|SG|AE|US)$/, '$1') // Remove country codes at end
-            .replace(/\s+\d+$/, '') // Remove any remaining trailing numbers
-            .trim();
-        
-        return merchant || "Unknown";
-    }
-
-    // Get all PDF files from statements directory
-    getPdfFiles() {
-        try {
-            if (!existsSync(this.statementsDir)) {
-                console.error(`Statements directory '${this.statementsDir}' not found.`);
-                return [];
-            }
-            
-            const files = readdirSync(this.statementsDir);
-            const pdfFiles = files
-                .filter(file => file.toLowerCase().endsWith('.pdf'))
-                .map(file => join(this.statementsDir, file));
-            
-            console.log(`Found ${pdfFiles.length} PDF files:`, pdfFiles.map(f => f.split('/').pop()));
-            return pdfFiles;
-        } catch (error) {
-            console.error('Error reading statements directory:', error.message);
-            return [];
-        }
-    }
-
-    // Parse all PDF statements
-    async parseStatements() {
-        const pdfFiles = this.getPdfFiles();
-        
+        // Find PDF files
+        const pdfFiles = getPdfFiles(CONFIG.statementsFolder);
         if (pdfFiles.length === 0) {
-            console.log('No PDF files found to parse.');
+            console.log('❌ No PDF files found in', CONFIG.statementsFolder);
             return;
         }
-
-        const statementPdfs = pdfFiles.map(filePath => ({
+        
+        console.log(`✓ Found ${pdfFiles.length} PDF files\n`);
+        
+        // Parse PDFs
+        await this.parsePdfFiles(pdfFiles);
+        
+        // Analyze transactions
+        this.analyzeTransactions();
+        
+        // Show results
+        this.displayResults();
+        
+        // Save output
+        this.saveResults();
+    }
+    
+    async parsePdfFiles(pdfFiles) {
+        console.log('Parsing PDF files...');
+        
+        // Prepare for parsing
+        const pdfsToProcess = pdfFiles.map(filepath => ({
             parserInput: {
-                filePath,
-                name: filePath.split('/').pop(),
+                filePath: filepath,
+                name: path.basename(filepath),
                 debug: true
             },
             type: ParserType.FabBank
         }));
-
+        
         try {
-            console.log('Parsing PDF statements...');
-            const results = await parsePdfs(statementPdfs);
+            // Parse all PDFs
+            const results = await parsePdfs(pdfsToProcess);
             
-            console.log(`Successfully parsed ${results.length} statements.`);
-            this.processResults(results);
+            // Extract transactions from results
+            for (const result of results) {
+                if (result && result.data) {
+                    this.extractTransactionsFromStatement(result);
+                }
+            }
+            
+            console.log(`✓ Extracted ${this.transactions.length} transactions\n`);
             
         } catch (error) {
-            console.error('Error parsing statements:', error.message);
-            console.error('Make sure the PDF files are valid FAB bank statements.');
+            console.error('❌ Error parsing PDFs:', error.message);
         }
     }
-
-    // Process parsing results
-    processResults(results) {
-        this.allTransactions = [];
-        let totalStatements = 0;
-        let totalTransactions = 0;
-
-        console.log('\n=== DETAILED PARSING RESULTS ===');
-        for (const [index, result] of results.entries()) {
-            console.log(`\nResult ${index + 1}:`);
-            console.log('Keys:', Object.keys(result));
-            
-            // Check if we have parsed data (even without explicit success flag)
-            if (result && result.data) {
-                totalStatements++;
-                const data = result.data;
+    
+    extractTransactionsFromStatement(result) {
+        const statement = result.data;
+        const fileName = result.parserInput?.name || 'unknown';
+        
+        // Process income transactions
+        if (statement.incomes) {
+            for (const income of statement.incomes) {
+                const transaction = {
+                    date: income.date,
+                    amount: income.amount, // Already positive from library
+                    description: income.description,
+                    merchant: cleanMerchantName(income.description),
+                    category: findCategory(income.description, this.categories),
+                    type: 'Credit',
+                    account: statement.name,
+                    file: fileName,
+                    originalText: income.originalText?.[0] || ''
+                };
                 
-                console.log(`\nProcessing statement: ${result.parserInput?.name || 'unknown'}`);
-                console.log(`Statement period: ${data.startDate} to ${data.endDate}`);
-                console.log(`Account holder: ${data.name}`);
-                console.log(`Account suffix: ${data.accountSuffix}`);
-                console.log(`Incomes found: ${data.incomes?.length || 0}`);
-                console.log(`Expenses found: ${data.expenses?.length || 0}`);
-                
-                // Process income transactions
-                if (data.incomes) {
-                    for (const transaction of data.incomes) {
-                        const merchant = this.extractMerchant(transaction.description);
-                        const category = this.categorizeTransaction(transaction.description);
-                        
-                        // Check if this is actually an outgoing payment misclassified as income
-                        let transactionType = 'Credit';
-                        
-                        // IPP Transfers are outgoing payments (debits) when they have a reference number
-                        if (transaction.description.toLowerCase().includes('ipp transfer instant payment') && 
-                            transaction.description.toLowerCase().includes('fab ref:')) {
-                            // This is an outgoing IPP transfer, should be a debit
-                            transactionType = 'Debit';
-                        }
-                        
-                        const processedTransaction = {
-                            date: transaction.date,
-                            amount: Math.abs(transaction.amount), // Always positive for consistency
-                            currency: 'AED', // FAB is AED
-                            description: transaction.description,
-                            merchant: merchant,
-                            category: category,
-                            type: transactionType,
-                            account: data.name,
-                            statementFile: result.parserInput?.name || 'unknown',
-                            originalText: transaction.originalText?.[0] || ''
-                        };
-                        
-                        this.allTransactions.push(processedTransaction);
-                        totalTransactions++;
-                    }
-                }
-                
-                // Process expense transactions
-                if (data.expenses) {
-                    for (const transaction of data.expenses) {
-                        const merchant = this.extractMerchant(transaction.description);
-                        const category = this.categorizeTransaction(transaction.description);
-                        
-                        const processedTransaction = {
-                            date: transaction.date,
-                            amount: Math.abs(transaction.amount), // Make positive for consistency
-                            currency: 'AED', // FAB is AED
-                            description: transaction.description,
-                            merchant: merchant,
-                            category: category,
-                            type: 'Debit',
-                            account: data.name,
-                            statementFile: result.parserInput?.name || 'unknown',
-                            originalText: transaction.originalText?.[0] || ''
-                        };
-                        
-                        this.allTransactions.push(processedTransaction);
-                        totalTransactions++;
-                    }
-                }
-            } else {
-                console.error(`Failed to parse ${result.parserInput?.name || 'unknown file'}:`);
-                console.error('Error details:', result.error || 'No data found');
+                this.transactions.push(transaction);
             }
         }
-
-        console.log(`\n=== PARSING SUMMARY ===`);
-        console.log(`Total statements processed: ${totalStatements}`);
-        console.log(`Total transactions found: ${totalTransactions}`);
         
-        this.generateSummary();
-        this.saveTransactions();
+        // Process expense transactions
+        if (statement.expenses) {
+            for (const expense of statement.expenses) {
+                const transaction = {
+                    date: expense.date,
+                    amount: Math.abs(expense.amount), // Convert negative to positive for consistency
+                    description: expense.description,
+                    merchant: cleanMerchantName(expense.description),
+                    category: findCategory(expense.description, this.categories),
+                    type: 'Debit',
+                    account: statement.name,
+                    file: fileName,
+                    originalText: expense.originalText?.[0] || ''
+                };
+                
+                this.transactions.push(transaction);
+            }
+        }
     }
-
-    // Generate transaction summary
-    generateSummary() {
-        console.log(`\n=== TRANSACTION SUMMARY ===`);
+    
+    analyzeTransactions() {
+        // Sort by date for proper balance tracking
+        this.transactions.sort((a, b) => new Date(a.date) - new Date(b.date));
         
-        // Extract balance information from originalText
-        let openingBalance = null;
-        let closingBalance = null;
-        let earliestDate = null;
-        let latestDate = null;
-        const monthlyBalances = {};
+        // Detect bounced cheques (pairs of deposit + return)
+        this.detectBouncedCheques();
         
-        // Sort all transactions by date to get chronological order
-        const sortedTransactions = [...this.allTransactions].sort((a, b) => 
-            new Date(a.date).getTime() - new Date(b.date).getTime()
+        // Process each transaction
+        for (const transaction of this.transactions) {
+            this.updateStats(transaction);
+            this.updateBalances(transaction);
+        }
+    }
+    
+    detectBouncedCheques() {
+        // Find cheque deposits
+        const chequeDeposits = this.transactions.filter(t => 
+            t.type === 'Credit' && 
+            (t.description.toLowerCase().includes('cheque deposit') ||
+             t.description.toLowerCase().includes('deposit cheque'))
         );
         
-        // Process each transaction to extract balance information
-        for (const transaction of sortedTransactions) {
-            const transactionDate = new Date(transaction.date);
-            const month = transactionDate.toISOString().substring(0, 7); // YYYY-MM format
-            
-            // Extract balance from originalText (last number in the string)
-            const balanceMatch = transaction.originalText.match(/[\d,]+\.?\d*$/);
-            if (balanceMatch) {
-                const balance = parseFloat(balanceMatch[0].replace(/,/g, ''));
+        // Find cheque returns
+        const chequeReturns = this.transactions.filter(t =>
+            t.description.toLowerCase().includes('returned cheque') ||
+            t.description.toLowerCase().includes('cheque returned') ||
+            t.description.toLowerCase().includes('outward cheque returned')
+        );
+        
+        // Mark bounced cheque pairs as internal
+        for (const deposit of chequeDeposits) {
+            for (const returnTx of chequeReturns) {
+                // Check if amounts match (within small tolerance for fees)
+                const amountDiff = Math.abs(deposit.amount - returnTx.amount);
+                const timeDiff = Math.abs(new Date(returnTx.date) - new Date(deposit.date));
+                const withinTimeWindow = timeDiff <= (90 * 24 * 60 * 60 * 1000); // 90 days
                 
-                // Track overall opening and closing balances
-                if (!earliestDate || transactionDate < earliestDate) {
-                    earliestDate = transactionDate;
-                    // Opening balance is before the first transaction
-                    if (transaction.type === 'Credit') {
-                        openingBalance = balance - transaction.amount;
-                    } else {
-                        openingBalance = balance + transaction.amount;
+                if (amountDiff <= 5 && withinTimeWindow) {
+                    // Mark both as bounced cheque pair
+                    deposit.isBouncedCheque = true;
+                    returnTx.isBouncedCheque = true;
+                    
+                    if (CONFIG.debugFiltering) {
+                        console.log(`🔍 BOUNCED CHEQUE PAIR DETECTED:`);
+                        console.log(`   Deposit: ${deposit.description} - ${formatMoney(deposit.amount)} on ${deposit.date}`);
+                        console.log(`   Return:  ${returnTx.description} - ${formatMoney(returnTx.amount)} on ${returnTx.date}`);
                     }
-                }
-                
-                // ALWAYS update closing balance with the chronologically latest transaction
-                if (!latestDate || transactionDate >= latestDate) {
-                    latestDate = transactionDate;
-                    closingBalance = balance; // Use the balance from this transaction
-                }
-                
-                // Track monthly balances
-                if (!monthlyBalances[month]) {
-                    monthlyBalances[month] = {
-                        openingBalance: null,
-                        closingBalance: null,
-                        earliestDate: null,
-                        latestDate: null
-                    };
-                }
-                
-                // Update monthly opening balance (earliest transaction in the month)
-                if (!monthlyBalances[month].earliestDate || transactionDate < monthlyBalances[month].earliestDate) {
-                    monthlyBalances[month].earliestDate = transactionDate;
-                    // Opening balance for the month is before this transaction
-                    if (transaction.type === 'Credit') {
-                        monthlyBalances[month].openingBalance = balance - transaction.amount;
-                    } else {
-                        monthlyBalances[month].openingBalance = balance + transaction.amount;
-                    }
-                }
-                
-                // ALWAYS update monthly closing balance with the chronologically latest transaction in the month
-                if (!monthlyBalances[month].latestDate || transactionDate >= monthlyBalances[month].latestDate) {
-                    monthlyBalances[month].latestDate = transactionDate;
-                    monthlyBalances[month].closingBalance = balance;
+                    break; // Each return should only match one deposit
                 }
             }
         }
-        
-        // Summary by category
-        const categoryTotals = {};
-        const monthlyTotals = {};
-        let totalDebits = 0;
-        let totalCredits = 0;
-        
-        // For accurate flow calculation, separate actual vs internal operations
-        let actualTotalDebits = 0;
-        let actualTotalCredits = 0;
-        const filteredTransactions = [];
-
-        for (const transaction of this.allTransactions) {
-            const category = transaction.category;
-            const amount = Math.abs(transaction.amount);
-            const isInternal = this.isInternalBankingOperation(transaction);
-            
-            // Handle date properly - convert Date object to string
-            let month;
-            if (transaction.date instanceof Date) {
-                month = transaction.date.toISOString().substring(0, 7); // YYYY-MM format
-            } else {
-                month = new Date(transaction.date).toISOString().substring(0, 7);
-            }
-            
-            // Category totals (include all transactions)
-            if (!categoryTotals[category]) {
-                categoryTotals[category] = { debit: 0, credit: 0, count: 0 };
-            }
-            
-            if (transaction.type === 'Debit') {
-                categoryTotals[category].debit += amount;
-                totalDebits += amount;
-                
-                // Only count non-internal operations for actual flow
-                if (!isInternal) {
-                    actualTotalDebits += amount;
-                } else if (amount > 100) {
-                    // Log filtered debits for debugging
-                    filteredTransactions.push({
-                        desc: transaction.description,
-                        amount: amount,
-                        type: transaction.type
-                    });
-                }
-            } else {
-                categoryTotals[category].credit += amount;
-                totalCredits += amount;
-                
-                // Only count non-internal operations for actual flow
-                if (!isInternal) {
-                    actualTotalCredits += amount;
-                } else if (amount > 100) {
-                    // Log filtered credits for debugging
-                    filteredTransactions.push({
-                        desc: transaction.description,
-                        amount: amount,
-                        type: transaction.type
-                    });
-                }
-            }
-            categoryTotals[category].count++;
-            
-            // Monthly totals (include all transactions)
-            if (!monthlyTotals[month]) {
-                monthlyTotals[month] = { debit: 0, credit: 0, count: 0 };
-            }
-            
-            if (transaction.type === 'Debit') {
-                monthlyTotals[month].debit += amount;
-            } else {
-                monthlyTotals[month].credit += amount;
-            }
-            monthlyTotals[month].count++;
-        }
-
-        // Display balance information
-        console.log('\n--- ACCOUNT BALANCE INFO ---');
-        if (openingBalance !== null && closingBalance !== null) {
-            console.log(`Opening Balance (${earliestDate?.toDateString()}): ${openingBalance.toFixed(2)} AED`);
-            console.log(`Closing Balance (${latestDate?.toDateString()}): ${closingBalance.toFixed(2)} AED`);
-            console.log(`Net Change: ${(closingBalance - openingBalance).toFixed(2)} AED`);
-        }
-        
-        // Display monthly balance information
-        console.log('\n--- MONTHLY BALANCE PROGRESSION ---');
-        Object.entries(monthlyBalances)
-            .sort(([a], [b]) => a.localeCompare(b))
-            .forEach(([month, balances]) => {
-                if (balances.openingBalance !== null && balances.closingBalance !== null) {
-                    const monthlyChange = balances.closingBalance - balances.openingBalance;
-                    console.log(`${month}:`);
-                    console.log(`  Opening:  ${balances.openingBalance.toFixed(2)} AED`);
-                    console.log(`  Closing:  ${balances.closingBalance.toFixed(2)} AED`);
-                    console.log(`  Change:   ${monthlyChange > 0 ? '+' : ''}${monthlyChange.toFixed(2)} AED`);
-                }
-            });
-        
-        // Display category summary
-        console.log('\n--- BY CATEGORY ---');
-        Object.entries(categoryTotals)
-            .sort(([,a], [,b]) => (b.debit + b.credit) - (a.debit + a.credit))
-            .forEach(([category, totals]) => {
-                console.log(`${category}:`);
-                console.log(`  Debits:  ${totals.debit.toFixed(2)} AED (${totals.count} transactions)`);
-                if (totals.credit > 0) {
-                    console.log(`  Credits: ${totals.credit.toFixed(2)} AED`);
-                }
-            });
-
-        // Display monthly summary
-        console.log('\n--- BY MONTH ---');
-        Object.entries(monthlyTotals)
-            .sort(([a], [b]) => a.localeCompare(b))
-            .forEach(([month, totals]) => {
-                console.log(`${month}:`);
-                console.log(`  Debits:  ${totals.debit.toFixed(2)} AED`);
-                console.log(`  Credits: ${totals.credit.toFixed(2)} AED`);
-                console.log(`  Net:     ${(totals.credit - totals.debit).toFixed(2)} AED`);
-                console.log(`  Transactions: ${totals.count}`);
-            });
-
-        console.log('\n--- TRANSACTION TOTALS ---');
-        console.log(`Total Debits:  ${totalDebits.toFixed(2)} AED`);
-        console.log(`Total Credits: ${totalCredits.toFixed(2)} AED`);
-        console.log(`Net Transaction Flow (All): ${(totalCredits - totalDebits).toFixed(2)} AED`);
-        console.log(`Total Transactions: ${this.allTransactions.length}`);
-        
-        console.log('\n--- FILTERED FLOW (Excluding Internal Operations) ---');
-        console.log(`Filtered Credits: ${actualTotalCredits.toFixed(2)} AED`);
-        console.log(`Filtered Debits:  ${actualTotalDebits.toFixed(2)} AED`);
-        console.log(`Filtered Net Flow: ${(actualTotalCredits - actualTotalDebits).toFixed(2)} AED`);
-        
-        if (filteredTransactions.length > 0) {
-            console.log('\n--- FILTERED OUT TRANSACTIONS (Internal) ---');
-            filteredTransactions.forEach(t => {
-                console.log(`${t.desc}: ${t.amount.toFixed(2)} AED`);
-            });
-            console.log(`Total Filtered: ${filteredTransactions.reduce((sum, t) => sum + t.amount, 0).toFixed(2)} AED`);
-        }
-        
-        const expectedNetChange = closingBalance !== null && openingBalance !== null ? closingBalance - openingBalance : null;
-        if (expectedNetChange !== null) {
-            console.log(`\n--- BALANCE RECONCILIATION ---`);
-            console.log(`Opening Balance: ${openingBalance.toFixed(2)} AED`);
-            console.log(`Closing Balance: ${closingBalance.toFixed(2)} AED`);
-            console.log(`Expected Net Change: ${expectedNetChange.toFixed(2)} AED ⭐ (TRUE MONEY MOVEMENT)`);
-            console.log(`Filtered Net Flow: ${(actualTotalCredits - actualTotalDebits).toFixed(2)} AED`);
-            
-            const filteredDifference = (actualTotalCredits - actualTotalDebits) - expectedNetChange;
-            console.log(`Filtered vs Expected Difference: ${Math.abs(filteredDifference).toFixed(2)} AED`);
-            
-            if (Math.abs(filteredDifference) < 1000) {
-                console.log(`✅ EXCELLENT! Filtered flow matches balance change (within ${Math.abs(filteredDifference).toFixed(2)} AED)`);
-            } else {
-                console.log(`🎯 INTELLIGENTLY FILTERED RESULT:`);
-                console.log(`   Filtered out ${((totalCredits - totalDebits) - (actualTotalCredits - actualTotalDebits)).toFixed(2)} AED of internal operations`);
-                console.log(`   Remaining difference: ${Math.abs(filteredDifference).toFixed(2)} AED`);
-                console.log(`   This represents complex banking operations that can't be easily identified`);
-                console.log(`\n📊 SUMMARY:`);
-                console.log(`   Raw Transaction Flow: ${(totalCredits - totalDebits).toFixed(2)} AED`);
-                console.log(`   Filtered Transaction Flow: ${(actualTotalCredits - actualTotalDebits).toFixed(2)} AED`);
-                console.log(`   ⭐ AUTHORITATIVE BALANCE CHANGE: ${expectedNetChange.toFixed(2)} AED`);
-                console.log(`\n✅ The balance change (${expectedNetChange.toFixed(2)} AED) is the most accurate measure of your true money movement.`);
-            }
-        }
-        
-        // Store balance info for export
-        this.balanceInfo = {
-            openingBalance,
-            closingBalance,
-            openingDate: earliestDate?.toISOString(),
-            closingDate: latestDate?.toISOString(),
-            netChange: closingBalance !== null && openingBalance !== null ? closingBalance - openingBalance : null,
-            actualMoneyInFlow: actualTotalCredits,
-            actualMoneyOutFlow: actualTotalDebits,
-            netMoneyFlow: actualTotalCredits - actualTotalDebits,
-            // Add reconciliation adjustment
-            reconciliationAdjustment: closingBalance !== null && openingBalance !== null 
-                ? (closingBalance - openingBalance) - (actualTotalCredits - actualTotalDebits)
-                : null,
-            reconciledNetFlow: closingBalance !== null && openingBalance !== null 
-                ? closingBalance - openingBalance 
-                : null,
-            monthlyBalances: Object.fromEntries(
-                Object.entries(monthlyBalances).map(([month, balances]) => [
-                    month,
-                    {
-                        openingBalance: balances.openingBalance,
-                        closingBalance: balances.closingBalance,
-                        openingDate: balances.earliestDate?.toISOString(),
-                        closingDate: balances.latestDate?.toISOString(),
-                        netChange: balances.openingBalance !== null && balances.closingBalance !== null 
-                            ? balances.closingBalance - balances.openingBalance 
-                            : null
-                    }
-                ])
-            )
-        };
     }
-
-    // Helper method to identify internal banking operations that shouldn't count toward money flow
-    isInternalBankingOperation(transaction) {
-        const description = transaction.description.toLowerCase();
-        const amount = transaction.amount;
+    
+    updateStats(transaction) {
+        const { category, amount, type } = transaction;
+        const month = getMonth(transaction.date);
+        const isInternal = isInternalTransaction(transaction);
         
-        // 1. Obvious internal adjustments (always exclude)
-        if (description.includes('reverse charges')) return true;
-        if (description.includes('fee reversal')) return true;
-        if (description.includes('charge reversal')) return true;
-        if (description.includes('balance adjustment')) return true;
+        // Initialize category if needed
+        if (!this.stats.byCategory[category]) {
+            this.stats.byCategory[category] = { 
+                debit: 0, 
+                credit: 0, 
+                count: 0 
+            };
+        }
         
-        // 2. Cash deposits (putting your own money back)
-        if (description.includes('atm cash deposit')) return true;
-        if (description.includes('cash deposit')) return true;
+        // Initialize month if needed
+        if (!this.stats.byMonth[month]) {
+            this.stats.byMonth[month] = { 
+                debit: 0, 
+                credit: 0, 
+                count: 0 
+            };
+        }
         
-        // 3. ALL transfers except Telex transfers (which are salary)
-        if (description.includes('transfer') && !description.includes('inward telex transfer')) return true;
+        // Update statistics
+        if (type === 'Debit') {
+            this.stats.byCategory[category].debit += amount;
+            this.stats.byMonth[month].debit += amount;
+            this.stats.totals.debits += amount;
+            
+            if (!isInternal) {
+                this.stats.filtered.debits += amount;
+            }
+        } else {
+            this.stats.byCategory[category].credit += amount;
+            this.stats.byMonth[month].credit += amount;
+            this.stats.totals.credits += amount;
+            
+            if (!isInternal) {
+                this.stats.filtered.credits += amount;
+            }
+        }
         
-        // 4. Switch transactions (ATM/Cash withdrawals that are internal)
-        if (description.includes('switch transaction')) return true;
-        
-        // 5. Only filter INWARD IPP payments (incoming transfers that are internal)
-        // But keep IPP transfers with BeneIBAN (outgoing payments) and IPP charges
-        if (description.includes('inward ipp payment')) return true;
-        
-        // 6. Very small credits (clearly adjustments)
-        if (transaction.type === 'Credit' && amount < 5) return true;
-        
-        // 7. Additional analysis shows some transactions may have timing differences
-        // but we should keep the filtering conservative and rely on the balance
-        // information from the statement as the authoritative source
-        
-        // Keep legitimate income/expenses:
-        // - "Inward Telex Transfer" (salary) ✓
-        // - Merchant transactions (POS settlements) ✓
-        // - Regular purchases and payments ✓
-        
-        return false;
+        this.stats.byCategory[category].count++;
+        this.stats.byMonth[month].count++;
     }
-
-    // Save transactions to JSON file
-    saveTransactions() {
+    
+    updateBalances(transaction) {
+        // Extract balance after this transaction
+        const balanceAfter = extractBalance(transaction.originalText);
+        if (balanceAfter === null) return;
+        
+        // Calculate balance before transaction
+        // Credit increases balance, so before = after - amount
+        // Debit decreases balance, so before = after + amount
+        const balanceBefore = transaction.type === 'Credit'
+            ? balanceAfter - transaction.amount
+            : balanceAfter + transaction.amount;
+        
+        const date = new Date(transaction.date);
+        const month = getMonth(date);
+        
+        // Update overall balances
+        if (!this.stats.balances.opening) {
+            this.stats.balances.opening = balanceBefore;
+            this.stats.balances.openingDate = date;
+        }
+        this.stats.balances.closing = balanceAfter;
+        this.stats.balances.closingDate = date;
+        
+        // Update monthly balances
+        if (!this.stats.balances[month]) {
+            this.stats.balances[month] = {
+                opening: balanceBefore,
+                openingDate: date
+            };
+        }
+        this.stats.balances[month].closing = balanceAfter;
+        this.stats.balances[month].closingDate = date;
+    }
+    
+    performAutoReconciliation(targetNetChange) {
+        // Find non-filtered transactions sorted by amount
+        const unfilteredTransactions = this.transactions.filter(t => !isInternalTransaction(t));
+        
+        // Calculate current stats
+        let currentCredits = unfilteredTransactions.filter(t => t.type === 'Credit').reduce((sum, t) => sum + t.amount, 0);
+        let currentDebits = unfilteredTransactions.filter(t => t.type === 'Debit').reduce((sum, t) => sum + t.amount, 0);
+        let currentNet = currentCredits - currentDebits;
+        
+        console.log(`   Target net change: ${formatMoney(targetNetChange)}`);
+        console.log(`   Current calculated: ${formatMoney(currentNet)}`);
+        console.log(`   Need to adjust by: ${formatMoney(currentNet - targetNetChange)}`);
+        
+        // Sort by amount descending to find large transactions to filter
+        const largeCandidates = unfilteredTransactions
+            .filter(t => t.amount > 1000) // Only consider significant amounts
+            .sort((a, b) => b.amount - a.amount);
+        
+        console.log(`   Found ${largeCandidates.length} large transactions that could be internal`);
+        
+        // Recalculate stats with aggressive filtering for large unexplained transactions
+        this.stats.filtered = { debits: 0, credits: 0 };
+        
+        for (const transaction of this.transactions) {
+            const isLargeUnexplained = largeCandidates.includes(transaction) && 
+                                     Math.abs(currentNet - targetNetChange) > CONFIG.reconciliationTolerance;
+            
+            if (!isInternalTransaction(transaction) && !isLargeUnexplained) {
+                if (transaction.type === 'Debit') {
+                    this.stats.filtered.debits += transaction.amount;
+                } else {
+                    this.stats.filtered.credits += transaction.amount;
+                }
+            }
+        }
+        
+        const adjustedNet = this.stats.filtered.credits - this.stats.filtered.debits;
+        console.log(`   Adjusted calculated: ${formatMoney(adjustedNet)}`);
+        console.log(`   New discrepancy: ${formatMoney(adjustedNet - targetNetChange)}`);
+    }
+    
+    displayResults() {
+        // Account Balance
+        console.log('\n=== ACCOUNT BALANCE ===');
+        if (this.stats.balances.opening !== undefined) {
+            const netChange = this.stats.balances.closing - this.stats.balances.opening;
+            console.log(`Opening: ${formatMoney(this.stats.balances.opening)}`);
+            console.log(`Closing: ${formatMoney(this.stats.balances.closing)}`);
+            console.log(`Change:  ${netChange >= 0 ? '+' : ''}${formatMoney(netChange)}`);
+        }
+        
+        // Auto-reconciliation: Adjust filtering for large discrepancies
+        if (this.stats.balances.opening !== undefined && this.stats.balances.closing !== undefined) {
+            const actualNetChange = this.stats.balances.closing - this.stats.balances.opening;
+            const calculatedNet = this.stats.filtered.credits - this.stats.filtered.debits;
+            const discrepancy = calculatedNet - actualNetChange;
+            
+            // If discrepancy is large, try to auto-correct by filtering more aggressively
+            if (Math.abs(discrepancy) > CONFIG.reconciliationTolerance) {
+                console.log('\n⚙️  Auto-adjusting for reconciliation...');
+                this.performAutoReconciliation(actualNetChange);
+            }
+        }
+        
+        // Monthly Summary
+        console.log('\n=== MONTHLY SUMMARY ===');
+        Object.entries(this.stats.byMonth)
+            .sort(([a], [b]) => a.localeCompare(b))
+            .forEach(([month, data]) => {
+                const net = data.credit - data.debit;
+                console.log(`\n${month}:`);
+                console.log(`  Income:   ${formatMoney(data.credit)}`);
+                console.log(`  Expenses: ${formatMoney(data.debit)}`);
+                console.log(`  Net:      ${net >= 0 ? '+' : ''}${formatMoney(net)}`);
+                console.log(`  Count:    ${data.count} transactions`);
+            });
+        
+        // Category Summary
+        console.log('\n=== SPENDING BY CATEGORY ===');
+        Object.entries(this.stats.byCategory)
+            .filter(([_, data]) => data.debit > 0)
+            .sort(([,a], [,b]) => b.debit - a.debit)
+            .forEach(([category, data]) => {
+                console.log(`\n${category}:`);
+                console.log(`  Spent: ${formatMoney(data.debit)} (${data.count} transactions)`);
+                if (data.credit > 0) {
+                    console.log(`  Refunds: ${formatMoney(data.credit)}`);
+                }
+            });
+        
+        // Overall Summary
+        console.log('\n=== OVERALL SUMMARY ===');
+        console.log(`Total Income:    ${formatMoney(this.stats.totals.credits)}`);
+        console.log(`Total Expenses:  ${formatMoney(this.stats.totals.debits)}`);
+        console.log(`Net (All):       ${formatMoney(this.stats.totals.credits - this.stats.totals.debits)}`);
+        console.log(`\nFiltered Income:   ${formatMoney(this.stats.filtered.credits)}`);
+        console.log(`Filtered Expenses: ${formatMoney(this.stats.filtered.debits)}`);
+        console.log(`Net (Filtered):    ${formatMoney(this.stats.filtered.credits - this.stats.filtered.debits)}`);
+        console.log(`\nTotal Transactions: ${this.transactions.length}`);
+        
+        // Show filtering summary
+        const filteredOutCredits = this.stats.totals.credits - this.stats.filtered.credits;
+        const filteredOutDebits = this.stats.totals.debits - this.stats.filtered.debits;
+        if (filteredOutCredits > 0 || filteredOutDebits > 0) {
+            console.log('\n=== FILTERING SUMMARY ===');
+            console.log(`Filtered Out Credits: ${formatMoney(filteredOutCredits)}`);
+            console.log(`Filtered Out Debits:  ${formatMoney(filteredOutDebits)}`);
+            console.log(`Net Filtered Out:     ${formatMoney(filteredOutCredits - filteredOutDebits)}`);
+            console.log('\n💡 Set CONFIG.debugFiltering = true to see individual filtered transactions');
+        }
+        
+        // Reconciliation Analysis
+        if (this.stats.balances.opening !== undefined && this.stats.balances.closing !== undefined) {
+            const actualNetChange = this.stats.balances.closing - this.stats.balances.opening;
+            const calculatedNet = this.stats.filtered.credits - this.stats.filtered.debits;
+            const discrepancy = calculatedNet - actualNetChange;
+            
+            console.log('\n=== RECONCILIATION ANALYSIS ===');
+            console.log(`Actual Balance Change: ${formatMoney(actualNetChange)}`);
+            console.log(`Calculated Net Flow:   ${formatMoney(calculatedNet)}`);
+            console.log(`Discrepancy:          ${formatMoney(discrepancy)}`);
+            
+            if (Math.abs(discrepancy) > CONFIG.reconciliationTolerance) {
+                console.log(`⚠️  Large discrepancy detected! This suggests transactions are being`);
+                console.log(`   misclassified as income/expenses when they should be internal.`);
+                console.log(`   Expected discrepancy < ${formatMoney(CONFIG.reconciliationTolerance)}`);
+            } else {
+                console.log(`✅ Reconciliation looks good (within tolerance)`);
+            }
+        }
+    }
+    
+    saveResults() {
+        // Calculate balance info
+        const netChange = this.stats.balances.opening !== undefined && this.stats.balances.closing !== undefined
+            ? this.stats.balances.closing - this.stats.balances.opening
+            : null;
+        
+        const actualNetFlow = this.stats.filtered.credits - this.stats.filtered.debits;
+        
+        // Create monthly balances in original format
+        const monthlyBalances = {};
+        Object.entries(this.stats.balances).forEach(([key, value]) => {
+            if (key !== 'opening' && key !== 'closing' && key !== 'openingDate' && key !== 'closingDate') {
+                monthlyBalances[key] = {
+                    openingBalance: value.opening,
+                    closingBalance: value.closing,
+                    openingDate: value.openingDate?.toISOString(),
+                    closingDate: value.closingDate?.toISOString(),
+                    netChange: value.opening !== undefined && value.closing !== undefined
+                        ? value.closing - value.opening
+                        : null
+                };
+            }
+        });
+        
+        // Original format that frontend expects
         const output = {
             generatedAt: new Date().toISOString(),
-            totalTransactions: this.allTransactions.length,
-            transactions: this.allTransactions,
-            summary: this.getSummaryData(),
-            balanceInfo: this.balanceInfo || null
+            totalTransactions: this.transactions.length,
+            transactions: this.transactions.map(t => ({
+                date: t.date,
+                amount: t.amount,
+                currency: CONFIG.currency,
+                description: t.description,
+                merchant: t.merchant,
+                category: t.category,
+                type: t.type,
+                account: t.account,
+                statementFile: t.file,
+                originalText: t.originalText
+            })),
+            summary: {
+                byCategory: this.stats.byCategory,
+                byMonth: this.stats.byMonth
+            },
+            balanceInfo: {
+                openingBalance: this.stats.balances.opening,
+                closingBalance: this.stats.balances.closing,
+                openingDate: this.stats.balances.openingDate?.toISOString(),
+                closingDate: this.stats.balances.closingDate?.toISOString(),
+                netChange: netChange,
+                actualMoneyInFlow: this.stats.filtered.credits,
+                actualMoneyOutFlow: this.stats.filtered.debits,
+                netMoneyFlow: actualNetFlow,
+                reconciliationAdjustment: netChange !== null ? netChange - actualNetFlow : null,
+                reconciledNetFlow: netChange,
+                monthlyBalances: monthlyBalances
+            }
         };
-
-        try {
-            writeFileSync(this.outputFile, JSON.stringify(output, null, 2));
-            console.log(`\nDetailed transactions saved to ${this.outputFile}`);
-        } catch (error) {
-            console.error('Error saving transactions:', error.message);
-        }
-    }
-
-    // Get summary data for export
-    getSummaryData() {
-        const categoryTotals = {};
-        const monthlyTotals = {};
-
-        for (const transaction of this.allTransactions) {
-            const category = transaction.category;
-            const amount = Math.abs(transaction.amount);
-            
-            // Handle date properly - convert Date object to string
-            let month;
-            if (transaction.date instanceof Date) {
-                month = transaction.date.toISOString().substring(0, 7); // YYYY-MM format
-            } else {
-                month = new Date(transaction.date).toISOString().substring(0, 7);
-            }
-            
-            if (!categoryTotals[category]) {
-                categoryTotals[category] = { debit: 0, credit: 0, count: 0 };
-            }
-            if (!monthlyTotals[month]) {
-                monthlyTotals[month] = { debit: 0, credit: 0, count: 0 };
-            }
-            
-            if (transaction.type === 'Debit') {
-                categoryTotals[category].debit += amount;
-                monthlyTotals[month].debit += amount;
-            } else {
-                categoryTotals[category].credit += amount;
-                monthlyTotals[month].credit += amount;
-            }
-            
-            categoryTotals[category].count++;
-            monthlyTotals[month].count++;
-        }
-
-        return {
-            byCategory: categoryTotals,
-            byMonth: monthlyTotals
-        };
-    }
-
-    // Run the parser
-    async run() {
-        console.log('=== FAB Statement Parser ===');
-        console.log('Parsing FAB bank statement PDFs...\n');
         
-        // Save categories file for user customization
-        this.saveCategories();
-        
-        await this.parseStatements();
-        
-        console.log(`\n=== PARSER COMPLETE ===`);
-        console.log(`Categories file: ${this.categoriesFile} (customize merchant categories here)`);
-        console.log(`Transactions: ${this.outputFile}`);
-        console.log('\nTo customize categories, edit the categories.json file and run the parser again.');
+        saveJsonFile(CONFIG.outputFile, output);
     }
 }
 
-// Run the parser if this file is executed directly
+// ==========================================
+// RUN THE PARSER
+// ==========================================
+
 if (require.main === module) {
     const parser = new FABStatementParser();
     parser.run().catch(console.error);

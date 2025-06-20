@@ -29,15 +29,16 @@ import {
   Category as CategoryIcon,
 } from '@mui/icons-material';
 import { Treemap, ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, PieChart, Pie, Cell } from 'recharts';
-import { TransactionSummary } from '../App';
+import { TransactionSummary, Transaction } from '../App';
 
 interface CategoryAnalysisProps {
   data: TransactionSummary;
+  filteredTransactions: Transaction[];
 }
 
 const COLORS = ['#0088FE', '#00C49F', '#FFBB28', '#FF8042', '#8884D8', '#82CA9D', '#FFC658', '#FF7C7C', '#8dd1e1', '#d084d0'];
 
-const categoryIcons: Record<string, JSX.Element> = {
+const categoryIcons: Record<string, React.ReactElement> = {
   'Food & Dining': <Restaurant />,
   'Transportation': <DirectionsCar />,
   'Shopping': <ShoppingCart />,

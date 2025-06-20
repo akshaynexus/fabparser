@@ -28,6 +28,6 @@
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false
   },
-  "include": ["frontend/src/**/*"],
+  "include": ["src/**/*"],
   "exclude": ["node_modules"]
 }

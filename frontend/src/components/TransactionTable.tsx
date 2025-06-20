@@ -1,8 +1,11 @@
 import React from 'react';
 import { Grid, Card, CardContent, Typography } from '@mui/material';
+import { Transaction } from '../App';
 
 interface TransactionTableProps {
   data: any;
+  filteredTransactions: Transaction[];
+  searchQuery?: string;
 }
 
 const TransactionTable: React.FC<TransactionTableProps> = ({ data }) => {

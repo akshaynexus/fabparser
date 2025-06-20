@@ -1,9 +1,11 @@
 import React from 'react';
 import { Grid, Card, CardContent, Typography, Box } from '@mui/material';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, BarChart, Bar } from 'recharts';
+import { Transaction } from '../App';
 
 interface MonthlyTrendsProps {
   data: any;
+  filteredTransactions: Transaction[];
 }
 
 const MonthlyTrends: React.FC<MonthlyTrendsProps> = ({ data }) => {
